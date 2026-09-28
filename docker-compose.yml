@@ -1,0 +1,21 @@
+services:
+  mspc:
+    build: .
+    image: mspc-api:latest
+    container_name: mspc-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite database file inside the container (persisted via volume).
+      MSPC_DB_PATH: /data/mspc.db
+      # Optional tuning (defaults shown):
+      # MSPC_MERGE_TOLERANCE: "0.0001"
+      # MSPC_PRUNE_THRESHOLD: "1e-12"
+      # MSPC_TOP_N_MAX: "200"
+      # MSPC_TOP_N_DEFAULT: "20"
+    volumes:
+      - mspc-data:/data
+    restart: unless-stopped
+
+volumes:
+  mspc-data:
