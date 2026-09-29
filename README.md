@@ -685,12 +685,36 @@ curl -X POST http://localhost:8000/api/v1/formula-search \
 - `calibration_points`：**按输入顺序**返回各点；`index` 为 0 基输入索引，`theoretical_mz` 为理论单同位素 m/z，`residual_mz`/`residual_ppm` 为相对**最终模型**的残差（观测 − 模型预测；ppm 以理论 m/z 为分母），`inlier` 为初模筛选标记。解析失败的点 `valid: false`、理论/残差/标记字段为 `null`，并带 `error`（`invalid_formula` 或 `invalid_adduct`）与 `message`。
 - `calibrated_mz`：与请求 `mz` 顺序一致，每项回显原 `mz` 并给出逆变换后的 `calibrated_mz`。
 
+**极大观测 m/z 的数值稳定性**：`observed_mz` 允许取任何正的有限双精度浮点数（最大约 1.8×10³⁰⁸）。成对初模的斜率/截距、初模残差、内点最小二乘的均值与方差/协方差累加以及最终逐点残差，在物理量纲直接计算会溢出时自动改用 2 的幂缩放形式（缩放除法为精确运算，普通量纲输入仍走原逐位相同的直接路径），因此三个内点的观测 m/z 即便都接近浮点上界——此时普通 `sum(y)/n` 已为无穷、`(x-x̄)²` 直接溢出，会得到无穷斜率与 NaN 残差——仍能返回有限的正斜率、截距与逐点残差。逆变换按 `mz/slope − intercept/slope` 计算：**先除以斜率再相减**，避免负截距下 `mz − intercept` 在除法前先溢出（例如 `slope=2`、`intercept=−10³⁰⁸`、`mz=10³⁰⁸` 时，朴素写法 `(10³⁰⁸+10³⁰⁸)/2` 先溢出成无穷，而真实结果 `10³⁰⁸` 完全可表示）。拟合出的模型本身在双精度下不可表示（参数或某校正结果真的超出浮点范围）时仍按 422 的 `non_positive_slope` 返回。
+
+例如三个参考点的元素计数分别取 10³⁰⁵、10³⁰⁶、10³⁰⁷ 量级（分子式即 `C` 后接 305/306/307 个 `9`，解析器对元素计数没有上限），其理论 m/z 约为 1.2×10³⁰⁶、1.2×10³⁰⁷、1.2×10³⁰⁸；`observed_mz` 取 `1.0000001 × 理论 m/z`，并把同量级的待校正 m/z 一并提交，即可得到有限的 `slope ≈ 1.0000001`、有限截距、各点有限残差以及有限的 `calibrated_mz`（朴素内点累加在这些输入上会得到无穷斜率与 NaN 残差，朴素逆变换还会先溢出成无穷）。
+
+```bash
+# 三个分子式分别为 C + 305/306/307 个 '9'；观测 m/z = 1.0000001 * 理论 m/z
+python3 - <<'PY'
+import json, urllib.request
+from app.calibration import theoretical_mz
+
+points = []
+for n in (305, 306, 307):
+    formula = "C" + "9" * n
+    points.append({"observed_mz": 1.0000001 * theoretical_mz(formula, "+H", 1),
+                   "formula": formula, "adduct": "+H", "charge": 1})
+mz = [points[-1]["observed_mz"]]
+body = json.dumps({"tolerance_ppm": 5.0,
+                   "calibration_points": points, "mz": mz}).encode()
+req = urllib.request.Request("http://localhost:8000/api/v1/mass-calibrate",
+                             data=body, headers={"Content-Type": "application/json"})
+print(json.dumps(json.load(urllib.request.urlopen(req)), indent=2)[:1200])
+PY
+```
+
 以下情形返回 **422**（不返回任何校准结果）：
 
 - 有效点为空（所有点分子式/加合物均解析失败）：`error` 为 `no_valid_points`；
 - 所有有效点的理论 m/z 相同、无法形成点对：`error` 为 `no_valid_point_pairs`；
 - 内点少于 3 个：`error` 为 `too_few_inliers`（信息中含内点数与 `tolerance_ppm`，可放宽容差或替换异常点后重试）；
-- 最小二乘斜率非正（≤ 0，逆变换无定义）：`error` 为 `non_positive_slope`。
+- 最小二乘斜率非正（≤ 0，逆变换无定义）或模型在双精度下不可表示：`error` 为 `non_positive_slope`。
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/mass-calibrate \

@@ -1,10 +1,13 @@
 """Unit tests for the robust mass-axis calibration module."""
 
+import math
+
 import pytest
 
 from app.calibration import (
     CalibrationError,
     CalibrationPoint,
+    MassCalibrationFit,
     calibrate_mass_axis,
     inverse_predict,
     theoretical_mz,
@@ -225,3 +228,109 @@ def test_residual_sign_convention():
     target = next(p for p in fit.points if p.formula == spec[0])
     assert target.residual_mz > 0
     assert target.residual_ppm > 0
+
+
+def test_huge_observed_values_keep_least_squares_finite():
+    # Observed m/z near the float maximum are legal finite inputs. The
+    # physical-unit OLS accumulators (sums, squared/cross deviations)
+    # overflow there and used to yield an infinite slope with NaN
+    # residuals; the scaled accumulators must still recover the model.
+    big_specs = [
+        ("C" + "9" * 305, "+H", 1),
+        ("C" + "9" * 306, "+H", 1),
+        ("C" + "9" * 307, "+H", 1),
+    ]
+    slope = 1.0000001
+    rows = [(slope * theoretical_mz(*spec), spec) for spec in big_specs]
+    fit = calibrate_mass_axis(make_points(rows), 5.0)
+    assert math.isfinite(fit.slope)
+    assert math.isfinite(fit.intercept)
+    assert fit.slope == pytest.approx(slope, rel=1e-6)
+    assert fit.inlier_count == 3
+    for point in fit.points:
+        assert point.inlier is True
+        assert math.isfinite(point.residual_mz)
+        assert math.isfinite(point.residual_ppm)
+        assert abs(point.residual_ppm) < 1.0
+
+
+def test_huge_slope_least_squares_does_not_overflow():
+    # Slope near 1e300 with ordinary theoretical m/z: y values around
+    # 1e302 keep the mean finite in a naive sum, but a still-larger slope
+    # (or a few more points) pushes the accumulators over the float edge;
+    # the intercept must stay at the y-scale to be representable there.
+    slope, intercept = 1e300, 1e287
+    rows = [
+        (slope * theoretical_mz(*spec) + intercept, spec)
+        for spec in REFERENCE_IONS[:5]
+    ]
+    fit = calibrate_mass_axis(make_points(rows), 5.0)
+    assert math.isfinite(fit.slope)
+    assert math.isfinite(fit.intercept)
+    assert fit.slope == pytest.approx(slope, rel=1e-6)
+    for point in fit.points:
+        assert math.isfinite(point.residual_ppm)
+
+
+def test_inverse_predict_negative_intercept_does_not_overflow():
+    # (mz - intercept)/slope with intercept = -1e308 subtracts two
+    # max-scale positives and overflows before the division; dividing by
+    # the slope first keeps the representable result finite.
+    fit = MassCalibrationFit(
+        slope=2.0,
+        intercept=-1e308,
+        valid_point_count=0,
+        inlier_count=0,
+        points=[],
+    )
+    assert inverse_predict(fit, 1e308) == pytest.approx(1e308, rel=0)
+    assert math.isfinite(inverse_predict(fit, 1.0))
+
+
+def test_inverse_predict_positive_intercept_large_mz():
+    fit = MassCalibrationFit(
+        slope=2.0,
+        intercept=1e308,
+        valid_point_count=0,
+        inlier_count=0,
+        points=[],
+    )
+    # mz == intercept: difference is zero either way.
+    assert inverse_predict(fit, 1e308) == 0.0
+
+
+def test_end_to_end_huge_inputs_return_finite_calibration():
+    # Full chain: huge inlier fit plus a huge m/z to calibrate, whose
+    # inverse transform used to be defeated by the subtraction order.
+    big_specs = [
+        ("C" + "9" * 305, "+H", 1),
+        ("C" + "9" * 306, "+H", 1),
+        ("C" + "9" * 307, "+H", 1),
+    ]
+    slope = 1.0000002
+    rows = [(slope * theoretical_mz(*spec), spec) for spec in big_specs]
+    fit = calibrate_mass_axis(make_points(rows), 5.0)
+    big_mz = theoretical_mz(*big_specs[-1]) * slope
+    calibrated = inverse_predict(fit, big_mz)
+    assert math.isfinite(calibrated)
+    assert calibrated == pytest.approx(theoretical_mz(*big_specs[-1]), rel=1e-9)
+
+
+def test_least_squares_cross_scale_deviations_stay_finite():
+    # x near 1e308 and y = 2*x - 1e308 near 1e307: the centred x and y
+    # deviations sit an order of magnitude apart, so naive cross products
+    # carry both infinite signs and math.fsum raises "-inf + inf"; the
+    # centroid sums themselves also overflow before division by n.
+    counts = ("5" + "0" * 306, "6" + "0" * 306, "7" + "0" * 306)
+    specs = [("C" + c, "+H", 1) for c in counts]
+    slope, intercept = 2.0, -1e308
+    rows = [
+        (slope * theoretical_mz(*spec) + intercept, spec) for spec in specs
+    ]
+    fit = calibrate_mass_axis(make_points(rows), 5.0)
+    assert math.isfinite(fit.slope) and math.isfinite(fit.intercept)
+    assert fit.slope == pytest.approx(2.0, rel=1e-9)
+    for point in fit.points:
+        assert math.isfinite(point.residual_ppm)
+    # The exact case the old inverse transform dropped to infinity:
+    assert inverse_predict(fit, 1e308) == pytest.approx(1e308, rel=1e-9)

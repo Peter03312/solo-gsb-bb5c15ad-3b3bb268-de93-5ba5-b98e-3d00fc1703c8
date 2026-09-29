@@ -1,5 +1,7 @@
 """API tests for POST /api/v1/mass-calibrate."""
 
+import math
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -311,3 +313,45 @@ def test_request_logged(client):
     assert len(rows) == 1
     assert rows[0][1] == 1
     assert "inliers" in rows[0][2]
+
+
+def test_huge_reference_points_return_finite_model(client):
+    # Legal finite observed m/z near the float maximum: the inlier
+    # least-squares accumulators used to overflow to an infinite slope
+    # (and NaN residuals), breaking response rendering.
+    big_specs = [
+        ("C" + "9" * 305, "+H", 1),
+        ("C" + "9" * 306, "+H", 1),
+        ("C" + "9" * 307, "+H", 1),
+    ]
+    slope = 1.0000001
+    points = [
+        {
+            "observed_mz": slope * theoretical_mz(formula, adduct, charge),
+            "formula": formula,
+            "adduct": adduct,
+            "charge": charge,
+        }
+        for formula, adduct, charge in big_specs
+    ]
+    big_mz = slope * theoretical_mz(*big_specs[-1])
+    payload = {
+        "calibration_points": points,
+        "tolerance_ppm": 5.0,
+        "mz": [big_mz],
+    }
+    resp = client.post("/api/v1/mass-calibrate", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert math.isfinite(body["slope"])
+    assert math.isfinite(body["intercept"])
+    assert body["slope"] == pytest.approx(slope, rel=1e-6)
+    assert body["inlier_count"] == 3
+    for point in body["calibration_points"]:
+        assert math.isfinite(point["residual_ppm"])
+        assert point["inlier"] is True
+    calibrated = body["calibrated_mz"][0]
+    assert math.isfinite(calibrated["calibrated_mz"])
+    assert calibrated["calibrated_mz"] == pytest.approx(
+        theoretical_mz(*big_specs[-1]), rel=1e-9
+    )
