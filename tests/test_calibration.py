@@ -1,5 +1,7 @@
 """Unit tests for the robust mass-axis calibration module."""
 
+import math
+
 import pytest
 
 from app.calibration import (
@@ -225,3 +227,92 @@ def test_residual_sign_convention():
     target = next(p for p in fit.points if p.formula == spec[0])
     assert target.residual_mz > 0
     assert target.residual_ppm > 0
+
+
+def _hydrogen_points(observed_mz, target_masses):
+    """Three valid calibration points whose theoretical m/z of H_n[H]+ is
+    near each requested mass, paired with the given observed values."""
+    points = []
+    for idx, (observed, target) in enumerate(zip(observed_mz, target_masses)):
+        count = max(1, int(target / 1.00782503223) - 1)
+        x = theoretical_mz(f"H{count}", "+H", 1)
+        # Snap the hydrogen count to the closest achievable theoretical m/z.
+        for candidate in range(count, count + 6):
+            candidate_x = theoretical_mz(f"H{candidate}", "+H", 1)
+            if abs(candidate_x - target) < abs(x - target):
+                count, x = candidate, candidate_x
+        points.append(CalibrationPoint(idx, observed, f"H{count}", "+H", 1))
+    return points
+
+
+def test_huge_observations_fit_without_infinite_slope_or_nan_residuals():
+    # Legal finite observations near 1e200: mean-centred raw least-squares
+    # used to overflow the sums (infinite slope) and the residual products
+    # (NaN residuals); the identity line must still be recovered.
+    targets = [1.0e200, 1.01e200, 1.02e200]
+    points = _hydrogen_points(targets, targets)  # observed == theoretical
+    fit = calibrate_mass_axis(points, 5.0)
+    assert math.isfinite(fit.slope)
+    assert fit.slope > 0.0
+    assert fit.slope == pytest.approx(1.0, rel=1e-9)
+    assert math.isfinite(fit.intercept)
+    assert fit.inlier_count == 3
+    for point in fit.points:
+        assert point.inlier is True
+        assert math.isfinite(point.residual_mz)
+        assert math.isfinite(point.residual_ppm)
+        assert point.residual_ppm == pytest.approx(0.0, abs=1e-6)
+
+
+def test_huge_observations_with_real_affine_model():
+    # slope 100, intercept -1e308 over x ~ 1.5e306: positive finite
+    # observations in the 1e307 range, where the old raw accumulations
+    # overflowed outright.
+    targets = [1.50e306, 1.55e306, 1.60e306]
+    points = _hydrogen_points(targets, targets)
+    xs = [theoretical_mz(p.formula, p.adduct, p.charge) for p in points]
+    observed = [100.0 * x - 1.0e308 for x in xs]
+    points = [
+        CalibrationPoint(i, observed[i], points[i].formula, "+H", 1)
+        for i in range(3)
+    ]
+    fit = calibrate_mass_axis(points, 5.0)
+    assert fit.slope == pytest.approx(100.0, rel=1e-9)
+    assert fit.intercept == pytest.approx(-1.0e308, rel=1e-9)
+    for point in fit.points:
+        assert math.isfinite(point.residual_mz)
+        assert math.isfinite(point.residual_ppm)
+
+
+def test_inverse_does_not_overflow_when_quotient_is_representable():
+    # (1e308 - (-1e308)) / 100: the raw subtraction saturates to inf but
+    # the calibrated result 2e306 is finite and representable.
+    fit = type("Fit", (), {"slope": 100.0, "intercept": -1.0e308})()
+    assert (1.0e308 - fit.intercept) == math.inf  # the old failure
+    result = inverse_predict(fit, 1.0e308)
+    assert math.isfinite(result)
+    assert result == pytest.approx(2.0e306, rel=1e-15)
+
+
+def test_inverse_saturates_when_result_truly_out_of_range():
+    # When the mathematical result itself exceeds the finite range, the
+    # stable computation returns +-inf instead of raising OverflowError.
+    fit = type("Fit", (), {"slope": 1.0, "intercept": -1.0e308})()
+    assert inverse_predict(fit, 1.7e308) == math.inf
+    fit_neg = type("Fit", (), {"slope": 1.0, "intercept": 1.0e308})()
+    assert inverse_predict(fit_neg, -1.7e308) == -math.inf
+
+
+def test_huge_data_negative_slope_still_rejected():
+    targets = [1.0e200, 1.01e200, 1.02e200]
+    points = _hydrogen_points(targets, targets)
+    points = [
+        CalibrationPoint(
+            p.index, -2.0 * theoretical_mz(p.formula, "+H", 1) + 1.0e200,
+            p.formula, "+H", 1,
+        )
+        for p in points
+    ]
+    with pytest.raises(CalibrationError) as exc:
+        calibrate_mass_axis(points, 1e7)
+    assert exc.value.error == "non_positive_slope"

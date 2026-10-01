@@ -1,5 +1,7 @@
 """API tests for POST /api/v1/mass-calibrate."""
 
+import math
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -311,3 +313,76 @@ def test_request_logged(client):
     assert len(rows) == 1
     assert rows[0][1] == 1
     assert "inliers" in rows[0][2]
+
+
+def _hydrogen_point(index, observed_mz, target_mass):
+    """A calibration point whose theoretical H_n[H]+ m/z is near target."""
+    count = max(1, int(target_mass / 1.00782503223) - 1)
+    x = theoretical_mz(f"H{count}", "+H", 1)
+    for candidate in range(count, count + 6):
+        candidate_x = theoretical_mz(f"H{candidate}", "+H", 1)
+        if abs(candidate_x - target_mass) < abs(x - target_mass):
+            count, x = candidate, candidate_x
+    return {
+        "observed_mz": observed_mz,
+        "formula": f"H{count}",
+        "adduct": "+H",
+        "charge": 1,
+    }, x
+
+
+def test_huge_legal_observations_return_finite_model(client):
+    # Regression: legal finite observations around 1e200 used to overflow
+    # the inlier least-squares sums (infinite slope / NaN residuals) and
+    # raise a 500. The identity calibration must be returned with finite
+    # fields instead.
+    targets = [1.0e200, 1.01e200, 1.02e200]
+    points = [_hydrogen_point(i, target, target)[0] for i, target in enumerate(targets)]
+    payload = {
+        "calibration_points": points,
+        "tolerance_ppm": 5.0,
+        "mz": [targets[0]],
+    }
+    resp = client.post("/api/v1/mass-calibrate", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert math.isfinite(body["slope"]) and body["slope"] > 0
+    assert body["slope"] == pytest.approx(1.0, rel=1e-8)
+    assert math.isfinite(body["intercept"])
+    assert body["valid_point_count"] == 3
+    assert body["inlier_count"] == 3
+    for point in body["calibration_points"]:
+        assert point["valid"] is True
+        assert point["inlier"] is True
+        assert math.isfinite(point["residual_mz"])
+        assert math.isfinite(point["residual_ppm"])
+    calibrated = body["calibrated_mz"][0]
+    assert math.isfinite(calibrated["calibrated_mz"])
+    assert calibrated["calibrated_mz"] == pytest.approx(targets[0], rel=1e-8)
+
+
+def test_inverse_overflowing_subtraction_still_calibrated(client):
+    # Regression: slope 100, intercept ~ -1e308; calibrating 1e308 needs
+    # (1e308 - (-1e308)) / 100, whose raw subtraction saturates to inf even
+    # though the calibrated result 2e306 is representable.
+    targets = [1.50e306, 1.55e306, 1.60e306]
+    built = [_hydrogen_point(i, 0.0, target) for i, target in enumerate(targets)]
+    points = []
+    for raw_point, x in built:
+        observed = 100.0 * x - 1.0e308
+        assert math.isfinite(observed) and observed > 0
+        raw_point["observed_mz"] = observed
+        points.append(raw_point)
+    payload = {
+        "calibration_points": points,
+        "tolerance_ppm": 5.0,
+        "mz": [1.0e308],
+    }
+    resp = client.post("/api/v1/mass-calibrate", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["slope"] == pytest.approx(100.0, rel=1e-8)
+    assert body["intercept"] == pytest.approx(-1.0e308, rel=1e-8)
+    calibrated = body["calibrated_mz"][0]["calibrated_mz"]
+    assert math.isfinite(calibrated)
+    assert calibrated == pytest.approx(2.0e306, rel=1e-8)

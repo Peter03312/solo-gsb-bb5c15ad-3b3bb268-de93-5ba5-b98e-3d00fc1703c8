@@ -1963,9 +1963,14 @@ def mass_calibrate(req: MassCalibrateRequest) -> dict:
     ``tolerance_ppm`` are inliers, and one ordinary least-squares line is
     fitted to them. The final slope, intercept, every point's residual and
     inlier flag are returned in request order, together with the requested
-    m/z values mapped through the inverse transform. No valid points, no
-    distinct-theoretical-m/z pair, fewer than three inliers or a
-    non-positive fitted slope answer 422.
+    m/z values mapped through the inverse transform. The pairwise medians,
+    ppm inlier test, inlier least squares and inverse transform are all
+    evaluated in shared binary scales, so legal observations near the top
+    of the finite float range neither overflow the least-squares sums (an
+    infinite slope or NaN residuals) nor the inverse subtraction against a
+    negative intercept. No valid points, no distinct-theoretical-m/z pair,
+    fewer than three inliers or a non-finite/non-positive fitted slope
+    answer 422.
     """
     points = [
         CalibrationPoint(
